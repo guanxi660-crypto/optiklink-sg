@@ -59,7 +59,8 @@ jobs:
           echo "🔄 下载 sing-box ${VER} ..."
           curl -sSL --fail -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-amd64.tar.gz"
           tar -xzf sb.tar.gz
-          mv "sing-box-${VER}-linux-amd64/sing-box" ./sb && chmod +x ./sb && rmdir "sing-box-${VER}-linux-amd64"
+          mv "sing-box-${VER}-linux-amd64/sing-box" ./sb && chmod +x ./sb
+          rm -rf "sing-box-${VER}-linux-amd64"   # 压缩包里还有 LICENSE 等文件，rmdir 删不掉非空目录
 
           # anytls outbound 需要 sing-box >= 1.12.0
           SBV=$(./sb version | head -1 | awk '{print $NF}')
