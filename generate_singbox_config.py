@@ -231,7 +231,8 @@ def build_config(link: str) -> dict:
         die(f"不支持的协议: {scheme}（当前支持 anytls / vless）")
 
     return {
-        "log": {"level": "warn", "timestamp": True},
+        # info 级别：出站拨号失败时能看到具体错误（目标/原因），便于诊断节点问题
+        "log": {"level": "info", "timestamp": True},
         "inbounds": [
             {
                 "type": "socks",

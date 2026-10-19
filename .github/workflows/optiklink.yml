@@ -108,18 +108,22 @@ jobs:
 
           # 出口 IP + 目标站点预检（上次失败的根因就是出口 IP 被站点 Cloudflare 拉黑）
           echo "🔄 测试代理连接..."
-          PROXY_IP=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10808 ifconfig.me 2>/dev/null || echo "")
+          PROXY_IP=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 ifconfig.me 2>/dev/null || true)
           if [ -n "$PROXY_IP" ]; then
             echo "✅ 代理工作正常，出口 IP: $PROXY_IP"
           else
-            echo "⚠️ 代理出口测试失败（可能目标网站不可达，继续执行）"
+            echo "❌ 代理出口测试失败（出站拨号不通），sing-box 日志："
+            tail -40 sb.log
+            echo "   节点不可用或配置有误，继续跑只会白费 —— 直接失败。"
+            exit 1
           fi
 
           SITE_CODE=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 \
             -o /dev/null -w '%{http_code}' \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-            https://optiklink.net/home 2>/dev/null || echo "000")
-          echo "🔎 预检 optiklink.net/home -> HTTP ${SITE_CODE}（出口 ${PROXY_IP:-未知}）"
+            https://optiklink.net/home 2>/dev/null || true)
+          SITE_CODE="${SITE_CODE:-000}"
+          echo "🔎 预检 optiklink.net/home -> HTTP ${SITE_CODE}（出口 ${PROXY_IP}）"
           if [ "$SITE_CODE" = "403" ]; then
             echo "❌ 出口 IP 被 OptikLink 的 Cloudflare 整段拉黑（403）。"
             echo "   脚本无解，需要换一个出口 IP 未被封的节点并更新 PROXY_LINK secret。"
