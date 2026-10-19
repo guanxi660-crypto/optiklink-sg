@@ -15,31 +15,39 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 
-import requests as _req  # 始终可用，cloudscraper 依赖它
+import requests as _req
 
-# 优先使用 cloudscraper 绕过 Cloudflare
-try:
-    import cloudscraper
-    USE_CLOUDSCRAPER = True
-    print("[信息] 使用 cloudscraper 绕过 Cloudflare 人机验证")
-except ImportError:
-    USE_CLOUDSCRAPER = False
-    print("[警告] cloudscraper 未安装，将使用普通 requests，可能无法绕过 Cloudflare")
+# 不用 cloudscraper：实测本站 Cloudflare 认得它的指纹、见到就 403，
+# 而普通 requests + 浏览器 UA 走正常节点能直接过盾
 
 # ─────────────────────────────────────────────────────────────
 # 配置（环境变量）
 # ─────────────────────────────────────────────────────────────
-DISCORD_TOKEN       = os.environ.get("DISCORD_TOKEN", "")
-TG_BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
-TG_CHAT_ID          = os.environ.get("CHAT_ID", "")
-EXPIRE_DATE_RAW     = os.environ.get("EXPIRE_DATE", "")
-DISCORD_CLIENT_ID   = os.environ.get("DISCORD_CLIENT_ID", "1005764586547838976")
-DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI", "https://optiklink.net/callback")
-PANEL_URL           = os.environ.get("PANEL_URL", "https://control.optiklink.net")
-PANEL_API_KEY       = os.environ.get("PANEL_API_KEY", "")
-PANEL_SERVER_ID     = os.environ.get("PANEL_SERVER_ID", "")
-SERVER_START_WAIT   = int(os.environ.get("SERVER_START_WAIT", "60"))
-PROXY_URL           = os.environ.get("PROXY_URL", "")
+def env(name: str, default: str = "") -> str:
+    """读环境变量。**空串视为未设置**。
+
+    旧写法 os.environ.get(name, default) 在 Actions 里给 Secret 赋空值时会拿到 ""
+    而不是 default，导致后面的默认值永远不生效。
+    """
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip()
+
+DISCORD_TOKEN       = env("DISCORD_TOKEN")
+TG_BOT_TOKEN        = env("BOT_TOKEN")
+TG_CHAT_ID          = env("CHAT_ID")
+EXPIRE_DATE_RAW     = env("EXPIRE_DATE")
+# 下面两个默认值是从站点真实登录流实测抓的（GET /login → 302 discordapp.com/...），
+# 旧默认 1005764586547838976 / optiklink.net/callback 是错的
+DISCORD_CLIENT_ID   = env("DISCORD_CLIENT_ID", "933437142254887052")
+DISCORD_REDIRECT_URI = env("DISCORD_REDIRECT_URI", "https://optiklink.com/login")
+DASHBOARD_URL       = env("DASHBOARD_URL", "https://optiklink.net/")
+PANEL_URL           = env("PANEL_URL", "https://control.optiklink.net")
+PANEL_API_KEY       = env("PANEL_API_KEY")
+PANEL_SERVER_ID     = env("PANEL_SERVER_ID")
+SERVER_START_WAIT   = int(env("SERVER_START_WAIT", "60"))
+PROXY_URL           = env("PROXY_URL")
 
 # 硬编码后备参数（从成功的登录链接中提取）
 FALLBACK_CLIENT_ID = "933437142254887052"
@@ -64,12 +72,43 @@ def mask(value: str, keep: int = 4) -> str:
 def mask_url(url: str) -> str:
     return re.sub(r'(code|token|access_token|refresh_token)=[^&]+', r'\1=***', url)
 
+def url_host(url: str) -> str:
+    return urlparse(url).netloc.lower()
+
+def is_optiklink_host(url: str) -> bool:
+    host = url_host(url)
+    return host.endswith("optiklink.net") or host.endswith("optiklink.com")
+
+# Cloudflare 两种拦截要区分对待：
+#   硬拦（1020 WAF，IP 被拉黑）→ 等多久都没用，立刻失败并提示换节点
+#   盾页（Just a moment）→ UC 模式大概率能自动过，等待重试
+CF_HARD_BLOCK_MARKERS = (
+    "sorry, you have been blocked",
+    "attention required",
+)
+CF_CHALLENGE_MARKERS = (
+    "just a moment",
+    "enable javascript and cookies to continue",
+    "checking your browser",
+    "verify you are human",
+)
+
+def classify_cf_page(html: str) -> str:
+    """返回 'hard' / 'challenge' / '' """
+    low = (html or "").lower()
+    if any(m in low for m in CF_HARD_BLOCK_MARKERS):
+        return "hard"
+    if any(m in low for m in CF_CHALLENGE_MARKERS):
+        return "challenge"
+    return ""
+
 def create_session():
-    """创建带有代理和浏览器头部的会话"""
-    if USE_CLOUDSCRAPER:
-        sess = cloudscraper.create_scraper()
-    else:
-        sess = _req.Session()
+    """普通 requests 会话 + 代理 + 浏览器 UA。
+
+    不用 cloudscraper（实测会被本站 Cloudflare 识别成 403），
+    节点正常时普通 requests 直接过盾。
+    """
+    sess = _req.Session()
     if PROXY_URL:
         sess.proxies = {"http": PROXY_URL, "https": PROXY_URL}
         print(f"[信息] 使用代理: {PROXY_URL}")
@@ -109,39 +148,60 @@ def tg_send(title: str, content: str):
 # 登录核心流程
 # ─────────────────────────────────────────────────────────────
 def discover_oauth_params(session):
+    """从站点真实登录流探测 OAuth 参数。
+
+    旧版探测 GET /auth —— 那是个纯营销页，根本没有 Discord 链接，所以探测从来
+    没成功过，全靠硬编码兜底。真实入口是 /login：它 302 到 login?action=login，
+    再 302 到 discord 的 authorize URL（client_id/redirect_uri/scope 全在里面）。
+    这里手动跟跳（最多 5 跳），停在第一个 discord 授权 URL 上解析参数。
+    """
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds",
+        "scope": "guilds guilds.join identify email",
+        "prompt": "none",
     }
-    print("[A] 探测 OAuth 参数...")
-    r = session.get("https://optiklink.net/auth", timeout=15, headers=HEADERS_BROWSER, allow_redirects=True)
-    print(f"    状态码: {r.status_code} 最终URL: {mask_url(r.url)}")
-    found = False
-    for pat in [r'https?://discord\.com(?:/api)?/oauth2/authorize[^\s\'"<>\\]+']:
-        m = re.search(pat, r.text)
-        if m:
-            raw_url = m.group(0).replace("&amp;", "&")
-            qs = parse_qs(urlparse(raw_url).query)
-            for k in ("client_id", "redirect_uri", "scope", "state"):
-                if qs.get(k):
-                    params[k] = qs[k][0]
-            found = True
+    print("[A] 探测 OAuth 参数（走真实登录流 /login）...")
+    url = "https://optiklink.net/login"
+    discord_url = ""
+    try:
+        for hop in range(5):
+            r = session.get(url, timeout=15, headers=HEADERS_BROWSER, allow_redirects=False)
+            print(f"    [{hop}] {mask_url(url)} -> {r.status_code}")
+            if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                nxt = r.headers["Location"]
+                if not nxt.startswith("http"):
+                    from urllib.parse import urljoin
+                    nxt = urljoin(url, nxt)
+                if "discordapp.com" in nxt or "discord.com" in nxt:
+                    discord_url = nxt
+                    break
+                url = nxt
+                continue
+            # 非跳转响应：看看页面里有没有现成的 discord 授权链接（万一以后改版）
+            m = re.search(r'https?://(?:discordapp\.com|discord\.com)/api?/?oauth2/authorize[^\s\'"<>\\]+', r.text)
+            if m:
+                discord_url = m.group(0).replace("&amp;", "&")
             break
-    if not found and "discord.com" in r.url:
-        qs = parse_qs(urlparse(r.url).query)
-        for k in ("client_id", "redirect_uri", "scope", "state"):
+    except Exception as e:
+        print(f"    ⚠️ 探测失败（{e}），用默认参数兜底")
+
+    if discord_url:
+        qs = parse_qs(urlparse(discord_url).query)
+        for k in ("client_id", "redirect_uri", "scope", "state", "prompt"):
             if qs.get(k):
                 params[k] = qs[k][0]
-        found = True
-    if params["client_id"] != DISCORD_CLIENT_ID:
-        new_cid = params["client_id"]
-        print(f"    client_id 变更: {mask(DISCORD_CLIENT_ID)} → {mask(new_cid)}")
-        github_output = os.environ.get("GITHUB_OUTPUT")
-        if github_output:
-            with open(github_output, "a") as f:
-                f.write(f"new_client_id={new_cid}\n")
+        print(f"    ✅ 探测成功 client_id={mask(params['client_id'])} redirect_uri={params['redirect_uri']}")
+        # client_id 真的变了才写输出，供后续步骤感知（别再把没变化的也写一遍）
+        if params["client_id"] != DISCORD_CLIENT_ID:
+            print(f"    client_id 变更: {mask(DISCORD_CLIENT_ID)} → {mask(params['client_id'])}")
+            github_output = os.environ.get("GITHUB_OUTPUT")
+            if github_output:
+                with open(github_output, "a") as f:
+                    f.write(f"new_client_id={params['client_id']}\n")
+    else:
+        print(f"    ⚠️ 未能探测到，使用默认参数 client_id={mask(params['client_id'])}")
     return params
 
 def discord_authorize(session, oauth_params):
@@ -177,25 +237,39 @@ def discord_authorize(session, oauth_params):
         "Referer": "https://discord.com/oauth2/authorize?" + urlencode(post_params),
         "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIn0=",
     }
-    
-    r = session.post("https://discord.com/api/v10/oauth2/authorize",
-                     params=post_params,
-                     json={"authorize": True, "permissions": "0"},
-                     headers=headers, timeout=15, allow_redirects=False)
-    print(f"    Discord 状态: {r.status_code}")
-    
-    if r.status_code == 200:
+
+    # 401/5xx 偶发出现（Discord 风控抖动，实测同一 token 同参数隔 2 小时重试就 200），
+    # 之前一次失败直接把整轮跑废，这里加重试
+    r = None
+    for attempt in range(1, 4):
         try:
-            data = r.json()
-            if "location" in data:
-                return data["location"]
-        except:
-            pass
-    
-    if r.status_code in (301,302,303,307,308) and "Location" in r.headers:
-        return r.headers["Location"]
-    
-    raise RuntimeError(f"Discord 授权失败 HTTP {r.status_code}")
+            r = session.post("https://discord.com/api/v10/oauth2/authorize",
+                             params=post_params,
+                             json={"authorize": True, "permissions": "0"},
+                             headers=headers, timeout=15, allow_redirects=False)
+        except Exception as e:
+            print(f"    Discord 请求异常 (第{attempt}次): {e}")
+            r = None
+        status = r.status_code if r is not None else 0
+        print(f"    Discord 状态: {status}" + (f" (第{attempt}次)" if attempt > 1 else ""))
+
+        if status == 200:
+            try:
+                data = r.json()
+                if "location" in data:
+                    return data["location"]
+            except Exception:
+                pass
+        if status in (301, 302, 303, 307, 308) and "Location" in r.headers:
+            return r.headers["Location"]
+        if status == 401:
+            print("    ⚠️ 401 通常是 Discord 临时风控（token 未失效），稍后重试")
+        if status not in (401, 429) and status < 500:
+            break                      # 参数类错误重试也没用，直接失败
+        if attempt < 3:
+            time.sleep(3)
+
+    raise RuntimeError(f"Discord 授权失败 HTTP {r.status_code if r is not None else 0}")
 
 # ─────────────────────────────────────────────────────────────
 # 浏览器登录 + Quick Verification
@@ -293,9 +367,33 @@ def browser_login(callback_url):
         kwargs["proxy"] = proxy
 
     with SB(**kwargs) as sb:
-        sb.uc_open_with_reconnect(callback_url, reconnect_time=5.0)
-        time.sleep(3)
+        # ── 打开回调页，并确认页面真的加载了 ──
+        # 上次失败的表象是「URL 一动不动、没有数学题」：浏览器被站点 Cloudflare 403
+        # 拦死，老代码不做加载校验就静默落到 dashboard 检查，报了个误导性的错误。
+        opened = False
+        for attempt in range(1, 4):
+            sb.uc_open_with_reconnect(callback_url, reconnect_time=5.0)
+            time.sleep(3)
+            cur = sb.get_current_url()
+            kind = classify_cf_page(sb.get_page_source())
+            if kind == "hard":
+                raise RuntimeError(
+                    "站点 Cloudflare 硬拦截（WAF 1020）：出口 IP 被拉黑，"
+                    "脚本无解，换节点后更新 PROXY_LINK secret"
+                )
+            if is_optiklink_host(cur):
+                opened = True
+                break
+            print(f"    ⚠️ 第 {attempt} 次打开未落到 OptikLink 页面: {mask_url(cur)}")
+            if kind == "challenge":
+                print("    Cloudflare 盾页，等 UC 过盾...")
+                time.sleep(8)
+        if not opened:
+            raise RuntimeError(
+                f"回调页打开失败（URL 未落到 OptikLink 域）: {mask_url(sb.get_current_url())}"
+            )
 
+        # ── Quick Verification（数学题 + Turnstile），令牌拿不到就重载重试 ──
         for attempt in range(1, 4):
             if not sb.is_element_present('input[name="math_answer"]'):
                 break          # 没有验证页，登录已直接完成
@@ -317,7 +415,11 @@ def browser_login(callback_url):
                 if len(token) > 50:
                     break
             if len(token) <= 50:
-                raise RuntimeError("Turnstile 令牌未获取")
+                # README 已知问题：令牌偶发拿不到。重载验证页重试（题目会变，循环会重读）
+                print("    ⚠️ Turnstile 令牌未获取，重载验证页重试")
+                sb.uc_open_with_reconnect(sb.get_current_url(), reconnect_time=4.0)
+                time.sleep(3)
+                continue
             print(f"    Turnstile 令牌长度 {len(token)}，提交中...")
             # 错误页把「答案错」和「令牌被拒」混在同一页面，提交前再读一次答案好区分
             before = sb.execute_script(MATH_VALUE_JS)
@@ -326,6 +428,9 @@ def browser_login(callback_url):
 
             sb.click('button[type="submit"]')
             time.sleep(3)
+        else:
+            if sb.is_element_present('input[name="math_answer"]'):
+                raise RuntimeError("Quick Verification 三次未通过（Turnstile 令牌/答案问题）")
 
         final_url = sb.get_current_url()
         print(f"    验证后URL: {mask_url(final_url)}")
@@ -333,30 +438,74 @@ def browser_login(callback_url):
             raise RuntimeError("访问被拦截 (VPN error page)")
         if '/error/' in final_url:
             raise RuntimeError(f"登录失败: {final_url}")
+        # code 没被消费 = 登录没完成，别带着无效会话去做后面的 dashboard 判断
+        if "/login" in final_url and "code=" in final_url:
+            raise RuntimeError(
+                "登录未完成：浏览器仍停在 /login?code= 回调页（code 交换失败或页面被拦截）"
+            )
 
-        sb.open("https://optiklink.net/")
+        sb.open(DASHBOARD_URL)
         sb.wait_for_ready_state_complete()
         time.sleep(2)
         return sb.get_page_source(), sb.get_current_url()
 
 def check_dashboard_html(html, final_url):
-    """Dashboard检测 - 判断逻辑保持原始不变"""
-    info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A"}
+    """登录态判断。
 
-    # 原始判断逻辑
-    if "DASHBOARD" in html.upper() and "/error/" not in final_url:
-        info["logged_in"] = True
-        m = re.search(r'Welcome\s+<[^>]+>([^<]+)</[^>]+>\s+to your Dashboard', html, re.I)
-        if m:
-            info["username"] = m.group(1)
+    老逻辑就一句 `"DASHBOARD" in html.upper()`，而未登录的营销首页本来就带
+    "Go to Dashboard"，等于永远为真 —— 之前能"成功"纯属巧合。这里改成
+    逐级信号：欢迎语 > 登出链接 > Dashboard 字样（且排除 Go to Dashboard），
+    并记录命中的信号，误判时日志里能看到依据。
+    """
+    info = {
+        "logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW,
+        "running_servers": "N/A", "signal": "", "reason": "",
+    }
+
+    # 硬条件：最终页面必须落在 OptikLink 域名下（被 403 拦截时不是）
+    if not is_optiklink_host(final_url):
+        info["reason"] = f"最终页面不在 OptikLink 域名下: {url_host(final_url) or '(空)'}"
+        print(f"    ❌ {info['reason']}")
+        return info
+    if "/error/" in final_url:
+        info["reason"] = f"落在错误页: {mask_url(final_url)}"
+        print(f"    ❌ {info['reason']}")
+        return info
+
+    # 信号 1：欢迎语（最具体，未登录页面不可能有）
+    m = re.search(r'Welcome\s+<[^>]+>([^<]+)</[^>]+>\s+to your Dashboard', html, re.I)
+    if m:
+        info.update(logged_in=True, username=m.group(1), signal="欢迎语")
+    else:
+        # 信号 2：登出/退出链接（登录态才有）
+        if re.search(r'\blog\s?out\b|\bsign\s?out\b|退出登录|登出', html, re.I):
+            info.update(logged_in=True, signal="登出链接")
+        else:
+            # 信号 3：Dashboard 字样，但必须排除未登录首页那个 "Go to Dashboard"
+            has_dash = "DASHBOARD" in html.upper()
+            has_goto = re.search(r'Go\s+to\s+Dashboard', html, re.I)
+            if has_dash and not has_goto:
+                info.update(logged_in=True, signal="Dashboard 字样（无 Go to）")
+
+    if info["logged_in"]:
+        print(f"    ✅ 登录态确认（信号: {info['signal']}）")
         m2 = re.search(r'(\d+)\s+servers?', html, re.I)
         if m2:
             info["running_servers"] = m2.group(1)
-        # 提取到期日期
         m3 = re.search(r'(\d{2}\.\d{2}\.\d{4})', html)
         if m3:
             info["expire_date"] = m3.group(1)
             print(f"    提取到期日期: {info['expire_date']}")
+    else:
+        # 都没命中，把页面实际内容记下来，别再让失败原因成谜
+        title = re.search(r'<title[^>]*>([^<]*)</title>', html, re.I)
+        title = title.group(1).strip() if title else "(无 title)"
+        goto_note = "有 Go to Dashboard" if re.search(r'Go\s+to\s+Dashboard', html, re.I) else "无 Go to Dashboard"
+        info["reason"] = (
+            f"页面无登录信号（title={title!r}, {goto_note}, "
+            f"url={mask_url(final_url)}）—— 大概率仍是未登录状态"
+        )
+        print(f"    ❌ {info['reason']}")
     return info
 
 # ─────────────────────────────────────────────────────────────
@@ -455,12 +604,12 @@ def build_report(info, server_result):
 # ─────────────────────────────────────────────────────────────
 def main():
     print("="*55)
-    print("OptikLink 自动登录 v6.0 (浏览器过 Turnstile 版)")
+    print("OptikLink 自动登录 v6.1 (sing-box 代理 + 明确失败原因)")
     print("="*55)
 
     print("\n========== 开始执行 ==========")
     session = create_session()
-    info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A"}
+    info = {"logged_in": False, "username": "N/A", "expire_date": EXPIRE_DATE_RAW, "running_servers": "N/A", "signal": "", "reason": ""}
     server_result = {"skipped": True}
 
     try:
@@ -472,7 +621,8 @@ def main():
         server_result = check_and_start_server(session)
 
         if not info["logged_in"]:
-            raise RuntimeError("Dashboard 未识别为登录状态")
+            # 带上具体原因，别再报一句干巴巴的「未识别为登录状态」
+            raise RuntimeError(f"登录态未确认: {info.get('reason') or '页面无登录信号'}")
     except Exception as e:
         error_msg = str(e)
         print(f"❌ 执行失败: {error_msg}")
