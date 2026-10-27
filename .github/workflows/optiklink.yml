@@ -41,14 +41,11 @@ jobs:
           python -m seleniumbase install || echo "⚠️ SB 内置浏览器安装失败，运行时再试"
           python -c "import seleniumbase; print('✅ seleniumbase', seleniumbase.__version__)"
 
-      - name: 下载并启动 sing-box 代理
+      - name: 下载 sing-box
         env:
-          PROXY_LINK: ${{ secrets.PROXY_LINK }}
-          VLESS_NODE: ${{ secrets.VLESS_NODE }}
           SB_FALLBACK_VERSION: "1.14.3"   # API 取不到最新版时的兜底
         run: |
           set -euo pipefail
-          trap 'rm -f sb.tar.gz sb sb.log' EXIT
 
           sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1
 
@@ -60,7 +57,7 @@ jobs:
           curl -sSL --fail -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-amd64.tar.gz"
           tar -xzf sb.tar.gz
           mv "sing-box-${VER}-linux-amd64/sing-box" ./sb && chmod +x ./sb
-          rm -rf "sing-box-${VER}-linux-amd64"   # 压缩包里还有 LICENSE 等文件，rmdir 删不掉非空目录
+          rm -rf "sing-box-${VER}-linux-amd64" sb.tar.gz   # 压缩包里还有 LICENSE 等文件，rmdir 删不掉非空目录
 
           # anytls outbound 需要 sing-box >= 1.12.0
           SBV=$(./sb version | head -1 | awk '{print $NF}')
@@ -70,65 +67,164 @@ jobs:
           fi
           echo "✅ sing-box ${SBV}（支持 anytls）"
 
-          if [ -z "$PROXY_LINK" ] && [ -z "$VLESS_NODE" ]; then
-            echo "❌ 未设置 PROXY_LINK secret（anytls 填这个；旧的 VLESS_NODE 仍可用）"
-            exit 1
-          fi
+      - name: 选择出口（直连优先，再逐个试节点）
+        env:
+          PROXY_LINK: ${{ secrets.PROXY_LINK }}
+          PROXY_LINK_BACKUP: ${{ secrets.PROXY_LINK_BACKUP }}
+          VLESS_NODE: ${{ secrets.VLESS_NODE }}
+        run: |
+          set -uo pipefail
 
-          # 生成并校验配置
-          python3 generate_singbox_config.py > config.json
-          jq . config.json >/dev/null
-          if ! ./sb check -c config.json; then
-            echo "❌ sing-box 配置校验失败"
-            cat config.json
-            exit 1
-          fi
-          NODE_TYPE=$(jq -r '.outbounds[0].type' config.json)
-          NODE_ADDR=$(jq -r '.outbounds[0].server' config.json)
-          NODE_PORT=$(jq -r '.outbounds[0].server_port' config.json)
-          echo "✅ 配置校验通过: ${NODE_TYPE} ${NODE_ADDR}:${NODE_PORT}"
+          N=$(python3 generate_singbox_config.py --count || true)
+          N="${N:-0}"
+          echo "候选节点数: $N"
+          python3 generate_singbox_config.py --list || true
 
-          # 启动
-          ./sb run -c config.json > sb.log 2>&1 &
-          SB_PID=$!
-          echo "SB_PID=$SB_PID" >> $GITHUB_ENV
+          # 结果通过 $GITHUB_ENV 交给后面的步骤；默认直连（PROXY_URL 为空）
+          echo "PROXY_URL=" >> "$GITHUB_ENV"
 
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 10808 2>/dev/null; then
-              echo "✅ 代理端口已就绪 (耗时 ${i} 秒)"
-              break
+          SB_PID=""
+          stop_sb() {
+            if [ -n "$SB_PID" ] && kill -0 "$SB_PID" 2>/dev/null; then
+              kill "$SB_PID" 2>/dev/null || true
+              wait "$SB_PID" 2>/dev/null || true
             fi
-            sleep 1
-          done
-          if ! nc -z 127.0.0.1 10808 2>/dev/null; then
-            echo "❌ 端口未就绪，sing-box 日志："
-            tail -30 sb.log
-            exit 1
-          fi
+            SB_PID=""
+          }
+          trap stop_sb EXIT
 
-          # 出口 IP + 目标站点预检（上次失败的根因就是出口 IP 被站点 Cloudflare 拉黑）
-          echo "🔄 测试代理连接..."
-          PROXY_IP=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 ifconfig.me 2>/dev/null || true)
-          if [ -n "$PROXY_IP" ]; then
-            echo "✅ 代理工作正常，出口 IP: $PROXY_IP"
+          WINNER="none"
+          EXIT_IP="?"
+          SITE_CODE="0"
+          VERDICT="ERROR"
+          DETAIL=""
+
+          # 解析 probe.json —— 用 python 而不是 jq：jq 是 apt 装的，装失败会静默降级成
+          # 「所有节点都不合格」，那才是最难受的故障
+          read_probe() {
+            VERDICT=$(python3 -c "import json;print(json.load(open('probe.json',encoding='utf-8')).get('verdict','ERROR'))" 2>/dev/null || echo ERROR)
+            SITE_CODE=$(python3 -c "import json;print(json.load(open('probe.json',encoding='utf-8')).get('code',0))" 2>/dev/null || echo 0)
+            EXIT_IP=$(python3 -c "import json;print(json.load(open('probe.json',encoding='utf-8')).get('exit_ip','?'))" 2>/dev/null || echo '?')
+            DETAIL=$(python3 -c "import json;print(json.load(open('probe.json',encoding='utf-8')).get('detail',''))" 2>/dev/null || echo '')
+            return 0
+          }
+
+          # ── 候选 0：直连。GitHub 运行器在 Azure 美国，大概率根本不需要代理 ──
+          echo "──────── 候选 0 / 直连（运行器出口 IP）────────"
+          if python3 site_probe.py --timeout 25 --out probe.json; then
+            read_probe
+            WINNER="direct"
+            echo "   ✅ 直连可用，本次完全不用代理"
           else
-            echo "❌ 代理出口测试失败（出站拨号不通），sing-box 日志："
-            tail -40 sb.log
-            echo "   节点不可用或配置有误，继续跑只会白费 —— 直接失败。"
-            exit 1
+            read_probe
+            case "$VERDICT" in
+              WAF_BLOCK) echo "   ✗ 运行器出口 IP 被站点 Cloudflare WAF 拉黑" ;;
+              *)         echo "   ✗ 直连不可用（$VERDICT），开始逐个试节点" ;;
+            esac
+
+            for i in $(seq 1 "$N"); do
+              echo "──────── 候选 #$i / $N ────────"
+              stop_sb
+
+              if ! NODE_INFO=$(PROXY_INDEX=$i python3 generate_singbox_config.py --describe); then
+                echo "   ❌ 链接解析失败，跳过"; continue
+              fi
+              read -r NODE_TYPE NODE_ADDR NODE_PORT NODE_NET <<< "$NODE_INFO"
+              NODE_NET="${NODE_NET:-tcp}"
+              echo "   节点: ${NODE_TYPE} ${NODE_ADDR}:${NODE_PORT}（${NODE_NET^^}）"
+
+              # ① 端口探测。hysteria2 走 QUIC/UDP，**不能拿 TCP 探** ——
+              # 它本来就不监听 TCP，探了必然 REFUSED，会把好节点误杀
+              if [ "$NODE_NET" = "udp" ]; then
+                echo "   ① TCP: 跳过（${NODE_TYPE} 是 QUIC/UDP，TCP 探测无意义）"
+              else
+                TCP_OUT=$(python3 tcp_probe.py "$NODE_ADDR" "$NODE_PORT" 8)
+                TCP_RC=$?
+                echo "   ① TCP: ${TCP_OUT}"
+                if [ "$TCP_RC" -ne 0 ]; then
+                  case "$TCP_RC" in
+                    2) echo "      → SYN 被丢（防火墙 DROP / 路由不通 / 节点离线）" ;;
+                    3) echo "      → 端口拒绝连接（服务没在监听：端口变了，或节点已下线）" ;;
+                    *) echo "      → 连接异常" ;;
+                  esac
+                  continue
+                fi
+              fi
+
+              PROXY_INDEX=$i python3 generate_singbox_config.py > config.json || {
+                echo "   ❌ 生成配置失败，跳过"; continue; }
+
+              if ! ./sb check -c config.json >/dev/null 2>&1; then
+                echo "   ❌ sing-box 配置校验失败："
+                ./sb check -c config.json 2>&1 | sed 's/^/      /'
+                continue
+              fi
+
+              : > sb.log
+              ./sb run -c config.json > sb.log 2>&1 &
+              SB_PID=$!
+              READY=0
+              for _ in $(seq 1 20); do
+                if nc -z 127.0.0.1 10808 2>/dev/null; then READY=1; break; fi
+                sleep 1
+              done
+              if [ "$READY" -ne 1 ]; then
+                echo "   ❌ 本地 socks 端口 10808 未就绪"
+                tail -20 sb.log | sed 's/^/      /'
+                continue
+              fi
+
+              # ② 出站 + 站点：一次请求同时验证「链路通」和「出口没被拉黑」
+              echo "   ② 出站 + 站点探测..."
+              if python3 site_probe.py --proxy socks5h://127.0.0.1:10808 --timeout 25 --out probe.json; then
+                read_probe
+                WINNER="#$i"
+                echo "   ✅ 节点 #$i 可用"
+                break
+              fi
+              read_probe
+              case "$VERDICT" in
+                WAF_BLOCK)
+                  echo "      → 出口 IP 被站点 WAF 拉黑（换地区，别再用这个 IP）" ;;
+                UNREACHABLE)
+                  echo "      → 出站拨号不通（TCP 通但握手/转发失败：密码、SNI 或 TLS 参数不对）"
+                  tail -20 sb.log | sed 's/^/      /' ;;
+                *)
+                  echo "      → 不可用，换下一个节点" ;;
+              esac
+            done
           fi
 
-          SITE_CODE=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 \
-            -o /dev/null -w '%{http_code}' \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-            https://optiklink.net/home 2>/dev/null || true)
-          SITE_CODE="${SITE_CODE:-000}"
-          echo "🔎 预检 optiklink.net/home -> HTTP ${SITE_CODE}（出口 ${PROXY_IP}）"
-          if [ "$SITE_CODE" = "403" ]; then
-            echo "❌ 出口 IP 被 OptikLink 的 Cloudflare 整段拉黑（403）。"
-            echo "   脚本无解，需要换一个出口 IP 未被封的节点并更新 PROXY_LINK secret。"
-            exit 1
+          if [ "$WINNER" != "none" ]; then
+            if [ "$WINNER" = "direct" ]; then
+              echo "PROXY_NODE=direct" >> "$GITHUB_ENV"
+            else
+              echo "PROXY_URL=socks5://127.0.0.1:10808" >> "$GITHUB_ENV"
+              echo "PROXY_NODE=$WINNER" >> "$GITHUB_ENV"
+            fi
+            trap - EXIT        # 这个 sing-box 进程要留给后续步骤，别杀
+            {
+              echo "### 出口"
+              echo ""
+              echo "| 项 | 值 |"
+              echo "|---|---|"
+              echo "| 选用 | $WINNER（候选 0=直连） |"
+              echo "| 出口 IP | \`$EXIT_IP\` |"
+              echo "| optiklink.net/home | HTTP $SITE_CODE / $VERDICT |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+
+          # 全军覆没：仍然直连跑一次，让浏览器自己去试（curl 被拦 ≠ 浏览器被拦）
+          trap - EXIT
+          echo "PROXY_NODE=none" >> "$GITHUB_ENV"
+          echo "::warning title=没有可用出口::直连和全部 $N 个节点都没通过探测，仍将用直连尝试一次。"
+          {
+            echo "### ⚠️ 没有可用出口"
+            echo ""
+            echo "直连 + $N 个候选节点全部未通过探测，本次仍用直连跑一次（浏览器可能比探测脚本更能过盾）。"
+            echo "若登录失败，先换一个**非香港 / 非俄罗斯**出口的节点 —— 这两个地区的 IP 实测被站点 WAF 拦。"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 执行自动登录+服务器保活脚本
         id: login
@@ -139,12 +235,25 @@ jobs:
           DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
           DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
           EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
-          PROXY_URL:            'socks5://127.0.0.1:10808'
+          PROXY_URL:            ${{ env.PROXY_URL }}
+          PROXY_NODE:           ${{ env.PROXY_NODE }}
           PANEL_API_KEY:        ${{ secrets.PANEL_API_KEY }}
           PANEL_SERVER_ID:      ${{ secrets.PANEL_SERVER_ID }}
           PANEL_URL:            "https://control.optiklink.net"
           SERVER_START_WAIT:    "60"
         run: |
+          # 跨步骤的后台进程理论上能活，但不赌：代理没在跑就先拉起来
+          if [ -n "${PROXY_URL:-}" ] && ! nc -z 127.0.0.1 10808 2>/dev/null; then
+            echo "⚠️ 代理进程已不在，用上次选中的配置重启 sing-box"
+            ./sb run -c config.json > sb.log 2>&1 &
+            for _ in $(seq 1 20); do
+              nc -z 127.0.0.1 10808 2>/dev/null && break
+              sleep 1
+            done
+          fi
+          if [ -z "${PROXY_URL:-}" ]; then
+            echo "⚠️ 无可用代理，本次直连执行"
+          fi
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python -u optiklink_login.py
 
       # 说明：原来的「自动更新 DISCORD_CLIENT_ID Secret」步骤已删除 ——

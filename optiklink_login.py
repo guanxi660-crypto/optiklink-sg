@@ -48,6 +48,8 @@ PANEL_API_KEY       = env("PANEL_API_KEY")
 PANEL_SERVER_ID     = env("PANEL_SERVER_ID")
 SERVER_START_WAIT   = int(env("SERVER_START_WAIT", "60"))
 PROXY_URL           = env("PROXY_URL")
+# workflow 里选路步骤写进 $GITHUB_ENV 的结果：direct / #2 / none
+PROXY_NODE          = env("PROXY_NODE", "none")
 
 # 硬编码后备参数（从成功的登录链接中提取）
 FALLBACK_CLIENT_ID = "933437142254887052"
@@ -111,9 +113,9 @@ def create_session():
     sess = _req.Session()
     if PROXY_URL:
         sess.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-        print(f"[信息] 使用代理: {PROXY_URL}")
+        print(f"[信息] 使用代理: {PROXY_URL}（选路结果 {PROXY_NODE}）")
     else:
-        print("[信息] 直连（无代理）")
+        print(f"[信息] 直连（无代理，选路结果 {PROXY_NODE}）")
     sess.headers.update(HEADERS_BROWSER)
     return sess
 
@@ -586,6 +588,7 @@ def build_report(info, server_result):
         f"**运行服务器**: {info['running_servers']} 个",
         f"**服务到期**: {info['expire_date']}",
         f"**剩余天数**: {days_left} 天",
+        f"**出口**: {PROXY_NODE if PROXY_URL else '直连'}",
         f"**执行时间**: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
     if not server_result.get("skipped"):
